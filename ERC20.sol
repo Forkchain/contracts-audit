@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.17;
+pragma solidity 0.8.17;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
@@ -13,6 +13,7 @@ contract SimpleToken is
     ERC20Burnable,
     AccessControlEnumerable
 {
+    
     bytes32 internal constant MINTER_ROLE = keccak256("MINTER_ROLE");
     bytes32 internal constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
@@ -24,7 +25,7 @@ contract SimpleToken is
         string memory _symbol,
         uint256 _initialSupply,
         address _defaultAdmin
-    ) ERC20(_name, _symbol) payable {
+    ) ERC20(_name, _symbol) {
         require(_defaultAdmin != address(0), 'Default Admin address can not be null address');
 
         _setupRole(DEFAULT_ADMIN_ROLE, _defaultAdmin);
@@ -59,7 +60,7 @@ contract SimpleToken is
          emit ContractPaused(false, msg.sender);
     }
 
-    function _mintTo(address _to, uint256 _amount)
+    function mint(address _to, uint256 _amount)
         public
         onlyRole(MINTER_ROLE)
     {

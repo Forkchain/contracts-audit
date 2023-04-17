@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.17;
+pragma solidity 0.8.17;
 
 import '@openzeppelin/contracts/token/ERC20/ERC20.sol';
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import '@openzeppelin/contracts/access/AccessControl.sol';
 import '@openzeppelin/contracts/access/Ownable.sol';
+import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
 import './interfaces/IUniswapV2Factory.sol';
 import './interfaces/IUniswapV2Router02.sol';
 
 contract ERC20Fees is ERC20, Ownable, AccessControl {
-  bytes32 public constant DAO = keccak256('DAO');
+  using SafeERC20 for IERC20;
 
   IUniswapV2Router02 public exchangeRouter;
 
-  address public tokenDAO;
   address public tokenPairAddress;
 
   mapping(address => bool) private _blacklist;
@@ -27,8 +28,12 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
   bool public swapEnabled = true;
 
   // Avoid having two swaps in the same block
-  bool private swappingRoyalty = false;
-  bool private swappingLiquidity = false;
+  bool private _swappingRoyalty = false;
+  bool private _swappingLiquidity = false;
+
+  //  TWAP Period
+  uint32 public constant TWAP_PERIOD = 10 minutes;
+
 
   uint256 public royaltySellingFee; // Fee going to royalties when selling the token (/1000)
   uint256 public liquidityBuyingFee; // Fee going to liquidity when buying the token (/1000)
@@ -51,47 +56,39 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
     uint256 _amount
   );
 
-  event DAOBurned(
-    address _daoAddress,
+  event TokenBurned(
+    address _address,
     uint256 _amountOfBurn
   );
 
-  event DAOWithdrawn (
-    address _daoAddress,
+  event Withdrawn (
+    address _address,
     uint256 _withdrawAmount
   );
 
-  event DAOERC20Withdrawn(
+  event ERC20Withdrawn(
     address _erc20Address,
     uint256 _withdrawAmount
   );
 
-  event DAOManualRoyaltySwapped(
-    address _daoAddress
+  event ManualRoyaltySwapped(
+    address _address
   );
 
-  event DAOManualLiquify(
-    address _daoAddress
+  event ManualLiquify(
+    address _address
   );
 
-  event DAOChanged(
-    address _newDAOAddress
-  );
-
-  event DAORevoked (
-    address _revokeDAOAddress
-  );
-
-  event BlacklistDAO(
-    address _daoAddress,
+  event BlacklistAdded(
+    address _address,
     bool _status
   );
 
-  event DAOSwapStatusToggled(
+  event SwapStatusToggled(
     bool _newStatus
   );
 
-  event DAOFeesExluded(
+  event FeesExluded(
     address _account, 
     bool _state
   );
@@ -100,28 +97,28 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
     address _newAddress
   );
 
-  event AutomatedMarketMakerPairDAO(
+  event AutomatedMarketMakerPair(
     address _pair, 
     bool _value
   );
 
-  event MinimumRoyaltyBalanceToSwapDAOChanged(
+  event MinimumRoyaltyBalanceToSwap(
     uint256 _newMinimumRoyalty
   );
 
-   event MinimumLiquidityFeeBalanceToSwapDAOChanged(
+   event MinimumLiquidityFeeBalanceToSwap(
     uint256 _newMinimumRoyalty
   );
 
-  event SetRoyaltySellingFeeDAO(
+  event SetRoyaltySellingFee(
     uint256 _royaltySellingFee
   );
 
-  event SetLiquidityBuyingFeeDAO(
+  event SetLiquidityBuyingFee(
     uint256 _liquidityBuyingFee
   );
 
-  event SetLiquiditySellingFeeDAO(
+  event SetLiquiditySellingFee(
     uint256 _liquiditySellingFee
   );
 
@@ -136,10 +133,10 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
   ) payable ERC20(_name, _symbol) {
     require(_defaultAdmin != address(0), 'Default Admin address can not be null address');
     require(_exchangeRouter != address(0), 'Exchange Router address can not be null address');
-
+    
     // Set up roles
     _setupRole(DEFAULT_ADMIN_ROLE, address(_defaultAdmin));
-    _setupRole(DAO, address(_defaultAdmin));
+
 
     // Set up token
     if(_initialSupply > 0) {
@@ -197,12 +194,17 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
     if (!_exemptFromFees[_from] && !_exemptFromFees[_to]) {
       // Selling
       if (automatedMarketMakerPairs[_to]) {
-        if (royaltySellingFee > 0) royaltyFees = (_amount * royaltySellingFee) / 1000;
-        if (liquiditySellingFee > 0) liquidityFees = (_amount * liquiditySellingFee) / 1000;
+        uint256 totalFee = royaltySellingFee + liquiditySellingFee;
+        require(totalFee <= 100_0, "Total fees exceed 100%");
+
+        if (royaltySellingFee > 0) royaltyFees = (_amount * royaltySellingFee) / 100_0;
+        if (liquiditySellingFee > 0) liquidityFees = (_amount * liquiditySellingFee) / 100_0;
+        require(totalFee <= 10_0, "Fees exceed maximum limit");
+
       }
       // Buying
       else if (automatedMarketMakerPairs[_from]) {
-        if (liquidityBuyingFee > 0) liquidityFees = (_amount * liquidityBuyingFee) / 1000;
+        if (liquidityBuyingFee > 0) liquidityFees = (_amount * liquidityBuyingFee) / 100_0;
       }
 
       uint256 totalFees = royaltyFees + liquidityFees;
@@ -224,24 +226,24 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
     if (swapEnabled && automatedMarketMakerPairs[_to]) {
       // If the one of the fee balances is above a certain amount, process it
       // Do not process both in one transaction
-      if (!swappingRoyalty && !swappingLiquidity && royaltyFeeBalance > minimumRoyaltyFeeBalanceToSwap) {
+      if (!_swappingRoyalty && !_swappingLiquidity && royaltyFeeBalance > minimumRoyaltyFeeBalanceToSwap) {
         // Forbid swapping royalty fees
-        swappingRoyalty = true;
+        _swappingRoyalty = true;
 
         // Perform the swap
         _swapRoyaltyFeeBalance();
 
         // Allow swapping
-        swappingRoyalty = false;
-      } else if (!swappingRoyalty && !swappingLiquidity && liquidityFeeBalance > minimumLiquidityFeeBalanceToSwap) {
+        _swappingRoyalty = false;
+      } else if (!_swappingRoyalty && !_swappingLiquidity && liquidityFeeBalance > minimumLiquidityFeeBalanceToSwap) {
         // Forbid swapping liquidity fees
-        swappingLiquidity = true;
+        _swappingLiquidity = true;
 
         // Perform the swap
         _liquify();
 
         // Allow swapping
-        swappingLiquidity = false;
+        _swappingLiquidity = false;
       }
     }
 
@@ -284,6 +286,23 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
 
   }
 
+  function _createOrGetPair() internal returns (IUniswapV2Pair uniswapPair) {
+        if (tokenPairAddress == address(0)) {
+            tokenPairAddress = IUniswapV2Factory(exchangeRouter.factory()).createPair(address(this), exchangeRouter.WETH());
+        }
+        return IUniswapV2Pair(tokenPairAddress);
+  }
+
+  function _consult(uint256 amountIn) internal returns (uint256 amountOut) {
+        IUniswapV2Pair uniswapPair = _createOrGetPair();
+        (uint112 reserve0, uint112 reserve1, ) = uniswapPair.getReserves();
+        uint256 reserveIn = address(this) == uniswapPair.token0() ? reserve0 : reserve1;
+        uint256 reserveOut = address(this) == uniswapPair.token0() ? reserve1 : reserve0;
+        amountOut = (amountIn * reserveOut) / reserveIn;
+    }
+
+
+
   // Swaps royalty fee balance for ETH and sends it to the royalty fee recipient
   function _swapRoyaltyFeeBalance() internal {
     require(royaltyFeeBalance > minimumRoyaltyFeeBalanceToSwap, 'Not enough tokens to swap for royalty fee');
@@ -304,15 +323,20 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
 
   // Swaps "_tokenAmount" for ETH
   function _swapTokenForEth(uint256 _tokenAmount) internal {
+    // Define the path of the token and WETH in the Uniswap V2 router
     address[] memory path = new address[](2);
     path[0] = address(this);
     path[1] = exchangeRouter.WETH();
 
+    // Approve the Uniswap V2 router to spend the token
     _approve(address(this), address(exchangeRouter), _tokenAmount);
+
+    // Get the minimum amount of ETH based on TWAP
+    uint256 _minAmountEth = _consult(_tokenAmount);
 
     exchangeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
       _tokenAmount,
-      0, // accept any amount of ETH
+      _minAmountEth, // accept any amount of ETH
       path,
       address(this),
       block.timestamp
@@ -330,7 +354,7 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
   }
 
   // Mint new tokens
-  function _mintTo(address _to, uint256 _amount) public onlyRole(DAO) {
+  function mint(address _to, uint256 _amount) public onlyRole(DEFAULT_ADMIN_ROLE) {
     require(_to != address(0), 'Minter Address can not be null address');
     require(_amount > 0, 'Mintable tokens count must be greater than 0');
 
@@ -339,126 +363,110 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
   }
 
   // Burns tokens
-  function burnDAO(address _from, uint256 _amount) public onlyRole(DAO) {
+  function burnTokens(address _from, uint256 _amount) public onlyRole(DEFAULT_ADMIN_ROLE) {
     require(_from != address(0), 'Minter Address can not be null address');
     require(_amount > 0, 'Mintable tokens count must be greater than 0');
     _burn(_from, _amount);
-    emit DAOBurned(_from, _amount);
+    emit TokenBurned(_from, _amount);
   }
 
-  function withdrawDAO(uint256 _amount) external onlyRole(DAO) {
+  function withdraw(uint256 _amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
      //send deploy feee to ForkChain
       (bool success, ) = payable(msg.sender).call{value: _amount}("");
       require(success, "Transfer failed.");
 
-      emit DAOWithdrawn(msg.sender, _amount);
+      emit Withdrawn(msg.sender, _amount);
   }
 
   // Withdraws an amount of tokens stored on the contract
-  function withdrawERC20DAO(address _erc20, uint256 _amount) external onlyRole(DAO) {
+  function withdrawERC20(address _erc20, uint256 _amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
     require(_erc20 != address(0), 'Minter Address can not be null address');
     require(_amount > 0, 'Mintable tokens count must be greater than 0');
 
-    bool success = IERC20(_erc20).transfer(msg.sender, _amount);
-    require(success, "Transfer failed.");
+   IERC20(_erc20).safeTransfer(msg.sender, _amount);
 
-    emit DAOERC20Withdrawn(_erc20, _amount);
+    emit ERC20Withdrawn(_erc20, _amount);
   }
 
   // Manually swaps the royalty fees
-  function manualRoyaltyFeeSwapDAO() external onlyRole(DAO) {
+  function manualRoyaltyFeeSwap() external onlyRole(DEFAULT_ADMIN_ROLE) {
     // Forbid swapping royalty fees
-    swappingRoyalty = true;
+    _swappingRoyalty = true;
 
     // Perform the swap
     _swapRoyaltyFeeBalance();
 
     // Allow swapping again
-    swappingRoyalty = false;
+    _swappingRoyalty = false;
 
-    emit DAOManualRoyaltySwapped(msg.sender);
+    emit ManualRoyaltySwapped(msg.sender);
   }
 
   // Manually add liquidity
-  function manualLiquifyDAO() external onlyRole(DAO) {
+  function manualLiquify() external onlyRole(DEFAULT_ADMIN_ROLE) {
     // Forbid swapping liquidity fees
-    swappingLiquidity = true;
+    _swappingLiquidity = true;
 
     // Perform swap
     _liquify();
 
     // Allow swapping again
-    swappingLiquidity = false;
+    _swappingLiquidity = false;
 
-    emit DAOManualLiquify(msg.sender);
+    emit ManualLiquify(msg.sender);
   }
 
-  function changeDAO(address _newDAO) external onlyRole(DAO) {
-    require(_newDAO != address(0), 'New DAO address cannot be the zero address');
-    revokeRole(DAO, tokenDAO);
-    tokenDAO = _newDAO;
-    grantRole(DAO, _newDAO);
-
-    emit DAOChanged(_newDAO);
-  }
-
-  function revokeDAO(address _daoToRevoke) external onlyRole(DAO) {
-    require(_daoToRevoke != address(0), 'Revoking DAO address cannot be the zero address');
-    revokeRole(DAO, _daoToRevoke);
-    emit DAORevoked(_daoToRevoke);
-  }
-
-  function blacklistDAO(address _user, bool _state) external onlyRole(DAO) {
+  function blacklistAddress(address _user, bool _state) external onlyRole(DEFAULT_ADMIN_ROLE) {
     require(_user != address(0), 'User address cannot be the zero address');
     _blacklist[_user] = _state;
-    emit BlacklistDAO(_user, _state);
+    emit BlacklistAdded(_user, _state);
   }
 
-  function toggleSwappingDAO() external onlyRole(DAO) {
+  function toggleSwapping() external onlyRole(DEFAULT_ADMIN_ROLE) {
     swapEnabled = !swapEnabled;
-    emit DAOSwapStatusToggled(swapEnabled);
+    emit SwapStatusToggled(swapEnabled);
   }
 
-  function excludeFromFeesDAO(address _account, bool _state) external onlyRole(DAO) {
+  function excludeFromFees(address _account, bool _state) external onlyRole(DEFAULT_ADMIN_ROLE) {
     require(_account != address(0), 'Account address can not be null address');
     _exemptFromFees[_account] = _state;
-    emit DAOFeesExluded(_account, _state);
+    emit FeesExluded(_account, _state);
   }
 
-  function setRoyaltyFeeRecipientDAO(address _royaltyFeeRecipient) external onlyRole(DAO) {
+  function setRoyaltyFeeRecipient(address _royaltyFeeRecipient) external onlyRole(DEFAULT_ADMIN_ROLE) {
     require(_royaltyFeeRecipient != address(0), 'Royalty recipient address can not be null address');
     royaltyFeeRecipient = payable(_royaltyFeeRecipient);
     emit RoayltyRecipientAddressChanged(_royaltyFeeRecipient);
   }
 
-  function setAutomatedMarketMakerPairDAO(address _pair, bool _value) external onlyRole(DAO) {
+  function setAutomatedMarketMakerPair(address _pair, bool _value) external onlyRole(DEFAULT_ADMIN_ROLE) {
     require(_pair != tokenPairAddress, 'The WETH / TOKEN pair cannot be removed from _automatedMarketMakerPairs');
     _setAutomatedMarketMakerPair(_pair, _value);
-    emit AutomatedMarketMakerPairDAO(_pair, _value);
+    emit AutomatedMarketMakerPair(_pair, _value);
   }
 
-  function setMinimumRoyaltyFeeBalanceToSwapDAO(uint256 _minimumRoyaltyFeeBalanceToSwap) external onlyRole(DAO) {
+  function setMinimumRoyaltyFeeBalanceToSwap(uint256 _minimumRoyaltyFeeBalanceToSwap) external onlyRole(DEFAULT_ADMIN_ROLE) {
     minimumRoyaltyFeeBalanceToSwap = _minimumRoyaltyFeeBalanceToSwap;
-    emit MinimumRoyaltyBalanceToSwapDAOChanged(_minimumRoyaltyFeeBalanceToSwap);
+    emit MinimumRoyaltyBalanceToSwap(_minimumRoyaltyFeeBalanceToSwap);
   }
 
-  function setMinimumLiquidityFeeBalanceToSwapDAO(uint256 _minimumLiquidityFeeBalanceToSwap) external onlyRole(DAO) {
+  function setMinimumLiquidityFeeBalanceToSwap(uint256 _minimumLiquidityFeeBalanceToSwap) external onlyRole(DEFAULT_ADMIN_ROLE) {
     minimumLiquidityFeeBalanceToSwap = _minimumLiquidityFeeBalanceToSwap;
-    emit MinimumLiquidityFeeBalanceToSwapDAOChanged(_minimumLiquidityFeeBalanceToSwap);
+    emit MinimumLiquidityFeeBalanceToSwap(_minimumLiquidityFeeBalanceToSwap);
   }
 
-  function setRoyaltySellingFeeDAO(uint256 _royaltySellingFee) external onlyRole(DAO) {
+  function setRoyaltySellingFee(uint256 _royaltySellingFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
     royaltySellingFee = _royaltySellingFee;
-    emit SetRoyaltySellingFeeDAO(_royaltySellingFee);
+    emit SetRoyaltySellingFee(_royaltySellingFee);
   }
 
-  function setLiquidityBuyingFeeDAO(uint256 _liquidityBuyingFee) external onlyRole(DAO) {
+  function setLiquidityBuyingFee(uint256 _liquidityBuyingFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
     liquidityBuyingFee = _liquidityBuyingFee;
-    emit SetLiquidityBuyingFeeDAO(_liquidityBuyingFee);
+    emit SetLiquidityBuyingFee(_liquidityBuyingFee);
   }
 
-  function setLiquiditySellingFeeDAO(uint256 _liquiditySellingFee) external onlyRole(DAO) {
+  function setLiquiditySellingFee(uint256 _liquiditySellingFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
     liquiditySellingFee = _liquiditySellingFee;
-    emit SetLiquiditySellingFeeDAO(_liquiditySellingFee);
+    emit SetLiquiditySellingFee(_liquiditySellingFee);
   }
 }
