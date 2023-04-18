@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import '@openzeppelin/contracts/access/AccessControl.sol';
 import '@openzeppelin/contracts/access/Ownable.sol';
 import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 import './interfaces/IUniswapV2Factory.sol';
 import './interfaces/IUniswapV2Router02.sol';
 
@@ -31,10 +32,6 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
   bool private _swappingRoyalty = false;
   bool private _swappingLiquidity = false;
 
-  //  TWAP Period
-  uint32 public constant TWAP_PERIOD = 10 minutes;
-
-
   uint256 public royaltySellingFee; // Fee going to royalties when selling the token (/1000)
   uint256 public liquidityBuyingFee; // Fee going to liquidity when buying the token (/1000)
   uint256 public liquiditySellingFee; // Fee going to liquidity when selling the token (/1000)
@@ -50,7 +47,6 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
   }
 
   /** Events Start*/
-
   event NewTokensMinted(
     address _minterAddress,
     uint256 _amount
@@ -226,24 +222,26 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
     if (swapEnabled && automatedMarketMakerPairs[_to]) {
       // If the one of the fee balances is above a certain amount, process it
       // Do not process both in one transaction
-      if (!_swappingRoyalty && !_swappingLiquidity && royaltyFeeBalance > minimumRoyaltyFeeBalanceToSwap) {
-        // Forbid swapping royalty fees
-        _swappingRoyalty = true;
+      if(!_swappingRoyalty && !_swappingLiquidity) {
+        if ( royaltyFeeBalance > minimumRoyaltyFeeBalanceToSwap) {
+          // Forbid swapping royalty fees
+          _swappingRoyalty = true;
 
-        // Perform the swap
-        _swapRoyaltyFeeBalance();
+          // Perform the swap
+          _swapRoyaltyFeeBalance();
 
-        // Allow swapping
-        _swappingRoyalty = false;
-      } else if (!_swappingRoyalty && !_swappingLiquidity && liquidityFeeBalance > minimumLiquidityFeeBalanceToSwap) {
-        // Forbid swapping liquidity fees
-        _swappingLiquidity = true;
+          // Allow swapping
+          _swappingRoyalty = false;
+        } else if (liquidityFeeBalance > minimumLiquidityFeeBalanceToSwap) {
+          // Forbid swapping liquidity fees
+          _swappingLiquidity = true;
 
-        // Perform the swap
-        _liquify();
+          // Perform the swap
+          _liquify();
 
-        // Allow swapping
-        _swappingLiquidity = false;
+          // Allow swapping
+          _swappingLiquidity = false;
+        }
       }
     }
 
@@ -256,18 +254,20 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
 
     uint256 oldBalance = address(this).balance;
 
-    // Sell half of the liquidity fee balance for ETH
-    uint256 lowerHalf = liquidityFeeBalance / 2;
-    uint256 upperHalf = liquidityFeeBalance - lowerHalf;
+    // Calculate the amount of tokens to be liquidated to ETH by using Alpha Homora one-sided liquidity mechanism
+    IUniswapV2Pair uniswapPair =IUniswapV2Pair(tokenPairAddress);
+    (,,uint256 fee) = IUniswapV2Pair(uniswapPair).getReserves();
+     uint256 amountTokensToSwap = ((Math.sqrt(address(this).balance * 3 * liquidityFeeBalance * fee)) - (Math.sqrt(liquidityFeeBalance) * 2 * fee)) / (Math.sqrt(fee) * 2);
+
 
     // Swap
-    _swapTokenForEth(lowerHalf);
-
-    // Update liquidityFeeBalance
-    liquidityFeeBalance = 0;
+    _swapTokenForEth(amountTokensToSwap);
 
     // Add liquidity
-    _addLiquidity(upperHalf, address(this).balance - oldBalance);
+    _addLiquidity(amountTokensToSwap, address(this).balance - oldBalance);
+
+     // Update liquidityFeeBalance
+    liquidityFeeBalance  -= amountTokensToSwap;
   }
 
   // Adds liquidity to the WETH / TOKEN pair on the AMM
@@ -285,23 +285,6 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
     );
 
   }
-
-  function _createOrGetPair() internal returns (IUniswapV2Pair uniswapPair) {
-        if (tokenPairAddress == address(0)) {
-            tokenPairAddress = IUniswapV2Factory(exchangeRouter.factory()).createPair(address(this), exchangeRouter.WETH());
-        }
-        return IUniswapV2Pair(tokenPairAddress);
-  }
-
-  function _consult(uint256 amountIn) internal returns (uint256 amountOut) {
-        IUniswapV2Pair uniswapPair = _createOrGetPair();
-        (uint112 reserve0, uint112 reserve1, ) = uniswapPair.getReserves();
-        uint256 reserveIn = address(this) == uniswapPair.token0() ? reserve0 : reserve1;
-        uint256 reserveOut = address(this) == uniswapPair.token0() ? reserve1 : reserve0;
-        amountOut = (amountIn * reserveOut) / reserveIn;
-    }
-
-
 
   // Swaps royalty fee balance for ETH and sends it to the royalty fee recipient
   function _swapRoyaltyFeeBalance() internal {
@@ -332,7 +315,11 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
     _approve(address(this), address(exchangeRouter), _tokenAmount);
 
     // Get the minimum amount of ETH based on TWAP
-    uint256 _minAmountEth = _consult(_tokenAmount);
+      IUniswapV2Pair uniswapPair = IUniswapV2Pair(tokenPairAddress);
+      (uint112 reserve0, uint112 reserve1, ) = uniswapPair.getReserves();
+      uint256 reserveIn = address(this) == uniswapPair.token0() ? reserve0 : reserve1;
+      uint256 reserveOut = address(this) == uniswapPair.token0() ? reserve1 : reserve0;
+      uint256 _minAmountEth = (_tokenAmount * reserveOut) / reserveIn;
 
     exchangeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
       _tokenAmount,
@@ -366,6 +353,7 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
   function burnTokens(address _from, uint256 _amount) public onlyRole(DEFAULT_ADMIN_ROLE) {
     require(_from != address(0), 'Minter Address can not be null address');
     require(_amount > 0, 'Mintable tokens count must be greater than 0');
+    require(allowance(_from, msg.sender) >= _amount, 'Burn amount exceeds allowance');
     _burn(_from, _amount);
     emit TokenBurned(_from, _amount);
   }
@@ -374,7 +362,6 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
      //send deploy feee to ForkChain
       (bool success, ) = payable(msg.sender).call{value: _amount}("");
       require(success, "Transfer failed.");
-
       emit Withdrawn(msg.sender, _amount);
   }
 
