@@ -1,459 +1,532 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.17;
 
-import '@openzeppelin/contracts/token/ERC20/ERC20.sol';
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import '@openzeppelin/contracts/access/AccessControl.sol';
-import '@openzeppelin/contracts/access/Ownable.sol';
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
-import "@openzeppelin/contracts/utils/math/Math.sol";
-import './interfaces/IUniswapV2Factory.sol';
-import './interfaces/IUniswapV2Router02.sol';
+import "@uniswap/v2-core/contracts/libraries/Math.sol";
+import "./interfaces/IUniswapV2Factory.sol";
+import "./interfaces/IUniswapV2Router02.sol";
 
 contract ERC20Fees is ERC20, Ownable, AccessControl {
-  using SafeERC20 for IERC20;
+    using SafeERC20 for IERC20;
 
-  IUniswapV2Router02 public exchangeRouter;
+    IUniswapV2Router02 public exchangeRouter;
 
-  address public tokenPairAddress;
+    address public tokenPairAddress;
 
-  mapping(address => bool) private _blacklist;
-  mapping(address => bool) private _exemptFromFees;
-  mapping(address => bool) public automatedMarketMakerPairs;
+    mapping(address => bool) private _blacklist;
+    mapping(address => bool) private _exemptFromFees;
+    mapping(address => bool) public automatedMarketMakerPairs;
 
-  address payable public royaltyFeeRecipient; // Address to which the ETH made from the fees are sent
-  uint256 public royaltyFeeBalance = 0; // FEE TOKEN balance accumulated from royalty fees
-  uint256 public liquidityFeeBalance = 0; // FEE TOKEN balance accumulated from liquidity fees
-  uint256 public minimumRoyaltyFeeBalanceToSwap; // FEE TOKEN balance required to perform a swap
-  uint256 public minimumLiquidityFeeBalanceToSwap; // FEE TOKEN balance required to add liquidity
-  bool public swapEnabled = true;
+    address payable public royaltyFeeRecipient; // Address to which the ETH made from the fees are sent
+    uint256 public royaltyFeeBalance = 0; // FEE TOKEN balance accumulated from royalty fees
+    uint256 public liquidityFeeBalance = 0; // FEE TOKEN balance accumulated from liquidity fees
+    uint256 public minimumRoyaltyFeeBalanceToSwap; // FEE TOKEN balance required to perform a swap
+    uint256 public minimumLiquidityFeeBalanceToSwap; // FEE TOKEN balance required to add liquidity
+    bool public swapEnabled = true;
 
-  // Avoid having two swaps in the same block
-  bool private _swappingRoyalty = false;
-  bool private _swappingLiquidity = false;
+    // Avoid having two swaps in the same block
+    bool private _swappingRoyalty = false;
+    bool private _swappingLiquidity = false;
 
-  uint256 public royaltySellingFee; // Fee going to royalties when selling the token (/1000)
-  uint256 public liquidityBuyingFee; // Fee going to liquidity when buying the token (/1000)
-  uint256 public liquiditySellingFee; // Fee going to liquidity when selling the token (/1000)
+    uint256 public royaltySellingFee; // Fee going to royalties when selling the token (/1000)
+    uint256 public liquidityBuyingFee; // Fee going to liquidity when buying the token (/1000)
+    uint256 public liquiditySellingFee; // Fee going to liquidity when selling the token (/1000)
 
-  // Used to avoid stack too deep errors
-  struct FeeSetup {
-    address royaltyFeeRecipient;
-    uint256 royaltySellingFee;
-    uint256 liquidityBuyingFee;
-    uint256 liquiditySellingFee;
-    uint256 minimumRoyaltyFeeBalanceToSwap;
-    uint256 minimumLiquidityFeeBalanceToSwap;
-  }
+    uint256 public constant maxPercentage = 100_0;
 
-  /** Events Start*/
-  event NewTokensMinted(
-    address _minterAddress,
-    uint256 _amount
-  );
-
-  event TokenBurned(
-    address _address,
-    uint256 _amountOfBurn
-  );
-
-  event Withdrawn (
-    address _address,
-    uint256 _withdrawAmount
-  );
-
-  event ERC20Withdrawn(
-    address _erc20Address,
-    uint256 _withdrawAmount
-  );
-
-  event ManualRoyaltySwapped(
-    address _address
-  );
-
-  event ManualLiquify(
-    address _address
-  );
-
-  event BlacklistAdded(
-    address _address,
-    bool _status
-  );
-
-  event SwapStatusToggled(
-    bool _newStatus
-  );
-
-  event FeesExluded(
-    address _account, 
-    bool _state
-  );
-
-  event RoayltyRecipientAddressChanged(
-    address _newAddress
-  );
-
-  event AutomatedMarketMakerPair(
-    address _pair, 
-    bool _value
-  );
-
-  event MinimumRoyaltyBalanceToSwap(
-    uint256 _newMinimumRoyalty
-  );
-
-   event MinimumLiquidityFeeBalanceToSwap(
-    uint256 _newMinimumRoyalty
-  );
-
-  event SetRoyaltySellingFee(
-    uint256 _royaltySellingFee
-  );
-
-  event SetLiquidityBuyingFee(
-    uint256 _liquidityBuyingFee
-  );
-
-  event SetLiquiditySellingFee(
-    uint256 _liquiditySellingFee
-  );
-
-  /** Events End*/
-  constructor(
-    string memory _name,
-    string memory _symbol,
-    uint256 _initialSupply,
-    address _defaultAdmin,
-    address _exchangeRouter,
-    FeeSetup memory _feeSetup
-  ) payable ERC20(_name, _symbol) {
-    require(_defaultAdmin != address(0), 'Default Admin address can not be null address');
-    require(_exchangeRouter != address(0), 'Exchange Router address can not be null address');
-    
-    // Set up roles
-    _setupRole(DEFAULT_ADMIN_ROLE, address(_defaultAdmin));
-
-
-    // Set up token
-    if(_initialSupply > 0) {
-      _mint(address(_defaultAdmin), _initialSupply);
+    // Used to avoid stack too deep errors
+    struct FeeSetup {
+        address royaltyFeeRecipient;
+        uint256 royaltySellingFee;
+        uint256 liquidityBuyingFee;
+        uint256 liquiditySellingFee;
+        uint256 minimumRoyaltyFeeBalanceToSwap;
+        uint256 minimumLiquidityFeeBalanceToSwap;
     }
 
-    // Link to AMM
-    exchangeRouter = IUniswapV2Router02(_exchangeRouter);
-    tokenPairAddress = IUniswapV2Factory(exchangeRouter.factory()).createPair(address(this), exchangeRouter.WETH());
-    _setAutomatedMarketMakerPair(address(tokenPairAddress), true);
+    /** Events Start*/
+    event NewTokensMinted(address minterAddress, uint256 amount);
 
-    // Exempt some addresses from fees
-    _exemptFromFees[msg.sender] = true;
-    _exemptFromFees[_defaultAdmin] = true;
-    _exemptFromFees[address(this)] = true;
-    _exemptFromFees[address(0)] = true;
+    event TokenBurned(address ownerAddress, uint256 amountOfBurn);
 
-    
-    // Set up fees
-    royaltyFeeRecipient = payable(_feeSetup.royaltyFeeRecipient);
-    royaltySellingFee = _feeSetup.royaltySellingFee;
-    liquidityBuyingFee = _feeSetup.liquidityBuyingFee;
-    liquiditySellingFee = _feeSetup.liquiditySellingFee;
+    event Withdrawn(address withdrawalAddress, uint256 withdrawAmount);
 
-    // Technical fee swapping thresholds
-    minimumRoyaltyFeeBalanceToSwap = _feeSetup.minimumRoyaltyFeeBalanceToSwap;
-    minimumLiquidityFeeBalanceToSwap = _feeSetup.minimumLiquidityFeeBalanceToSwap;
-  }
+    event ERC20Withdrawn(address erc20Address, uint256 withdrawAmount);
 
-  receive() external payable {}
+    event ManualRoyaltySwapped(address royaltyAddress);
 
-  // Checks for blacklist status before allowing transfer
-  function _beforeTokenTransfer(
-    address _from,
-    address _to,
-    uint256 _amount
-  ) internal virtual override(ERC20) {
-    require(!isBlacklisted(_from), 'Token transfer refused. Sender is blacklisted');
-    require(!isBlacklisted(_to), 'Token transfer refused. Recipient is blacklisted');
-    super._beforeTokenTransfer(_from, _to, _amount);
-  }
+    event ManualLiquify(address liquifyAddress);
 
-  // Collects relevant fees and performs a swap if needed
-  function _transfer(
-    address _from,
-    address _to,
-    uint256 _amount
-  ) internal override {
-    require(_from != address(0), 'Cannot transfer from the zero address');
-    require(_amount > 0, 'Cannot transfer 0 tokens');
-    uint256 royaltyFees = 0;
-    uint256 liquidityFees = 0;
+    event BlacklistAdded(address blacklistingAddress, bool status);
 
-    // Take fees on buys and sells
-    if (!_exemptFromFees[_from] && !_exemptFromFees[_to]) {
-      // Selling
-      if (automatedMarketMakerPairs[_to]) {
-        uint256 totalFee = royaltySellingFee + liquiditySellingFee;
-        require(totalFee <= 100_0, "Total fees exceed 100%");
+    event SwapStatusToggled(bool newStatus);
 
-        if (royaltySellingFee > 0) royaltyFees = (_amount * royaltySellingFee) / 100_0;
-        if (liquiditySellingFee > 0) liquidityFees = (_amount * liquiditySellingFee) / 100_0;
-        require(totalFee <= 10_0, "Fees exceed maximum limit");
+    event FeesExluded(address account, bool state);
 
-      }
-      // Buying
-      else if (automatedMarketMakerPairs[_from]) {
-        if (liquidityBuyingFee > 0) liquidityFees = (_amount * liquidityBuyingFee) / 100_0;
-      }
+    event RoayltyRecipientAddressChanged(address newAddress);
 
-      uint256 totalFees = royaltyFees + liquidityFees;
+    event AutomatedMarketMakerPair(address pair, bool value);
 
-      // Send fees to the FEETOKEN contract
-      if (totalFees > 0) {
-        // Send FEETOKEN tokens to the contract
-        super._transfer(_from, address(this), totalFees);
+    event MinimumRoyaltyBalanceToSwap(uint256 newMinimumRoyalty);
 
-        // Keep track of the FEETOKEN that were sent
-        royaltyFeeBalance += royaltyFees;
-        liquidityFeeBalance += liquidityFees;
-      }
+    event MinimumLiquidityFeeBalanceToSwap(uint256 newMinimumRoyalty);
 
-      _amount -= totalFees;
-    }
+    event SetRoyaltySellingFee(uint256 royaltySellingFee);
 
-    // Swapping logic - only trigger on sell
-    if (swapEnabled && automatedMarketMakerPairs[_to]) {
-      // If the one of the fee balances is above a certain amount, process it
-      // Do not process both in one transaction
-      if(!_swappingRoyalty && !_swappingLiquidity) {
-        if ( royaltyFeeBalance > minimumRoyaltyFeeBalanceToSwap) {
-          // Forbid swapping royalty fees
-          _swappingRoyalty = true;
+    event SetLiquidityBuyingFee(uint256 liquidityBuyingFee);
 
-          // Perform the swap
-          _swapRoyaltyFeeBalance();
+    event SetLiquiditySellingFee(uint256 liquiditySellingFee);
 
-          // Allow swapping
-          _swappingRoyalty = false;
-        } else if (liquidityFeeBalance > minimumLiquidityFeeBalanceToSwap) {
-          // Forbid swapping liquidity fees
-          _swappingLiquidity = true;
+    /** Events End*/
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        uint256 _initialSupply,
+        address _defaultAdmin,
+        address _exchangeRouter,
+        FeeSetup memory _feeSetup
+    ) payable ERC20(_name, _symbol) {
+        require(
+            _defaultAdmin != address(0),
+            "Default Admin address can not be null address"
+        );
+        require(
+            _exchangeRouter != address(0),
+            "Exchange Router address can not be null address"
+        );
 
-          // Perform the swap
-          _liquify();
+        // Set up roles
+        _setupRole(DEFAULT_ADMIN_ROLE, address(_defaultAdmin));
 
-          // Allow swapping
-          _swappingLiquidity = false;
+        // Set up token
+        if (_initialSupply > 0) {
+            _mint(address(_defaultAdmin), _initialSupply);
         }
-      }
+
+        // Link to AMM
+        exchangeRouter = IUniswapV2Router02(_exchangeRouter);
+        tokenPairAddress = IUniswapV2Factory(exchangeRouter.factory())
+            .createPair(address(this), exchangeRouter.WETH());
+        _setAutomatedMarketMakerPair(address(tokenPairAddress), true);
+
+        // Exempt some addresses from fees
+        _exemptFromFees[msg.sender] = true;
+        _exemptFromFees[_defaultAdmin] = true;
+        _exemptFromFees[address(this)] = true;
+        _exemptFromFees[address(0)] = true;
+
+        // Set up fees
+        royaltyFeeRecipient = payable(_feeSetup.royaltyFeeRecipient);
+        royaltySellingFee = _feeSetup.royaltySellingFee;
+        liquidityBuyingFee = _feeSetup.liquidityBuyingFee;
+        liquiditySellingFee = _feeSetup.liquiditySellingFee;
+
+        // Technical fee swapping thresholds
+        minimumRoyaltyFeeBalanceToSwap = _feeSetup
+            .minimumRoyaltyFeeBalanceToSwap;
+        minimumLiquidityFeeBalanceToSwap = _feeSetup
+            .minimumLiquidityFeeBalanceToSwap;
     }
 
-    super._transfer(_from, _to, _amount);
-  }
+    receive() external payable {}
 
-  // Swaps liquidity fee balance for ETH and adds it to the WETH / TOKEN pool
-  function _liquify() internal {
-    require(liquidityFeeBalance > minimumLiquidityFeeBalanceToSwap, 'Not enough tokens to swap for adding liquidity');
+    modifier totalFeeCalculation(
+        uint256 _royaltySellingFee,
+        uint256 _liquiditySellingFee
+    ) {
+        require(
+            _royaltySellingFee + _liquiditySellingFee <= 10_0,
+            "Total fees exceed 100%"
+        );
+        _;
+    }
 
-    uint256 oldBalance = address(this).balance;
+    // Checks for blacklist status before allowing transfer
+    function _beforeTokenTransfer(
+        address _from,
+        address _to,
+        uint256 _amount
+    ) internal virtual override(ERC20) {
+        require(
+            !isBlacklisted(_from),
+            "Token transfer refused. Sender is blacklisted"
+        );
+        require(
+            !isBlacklisted(_to),
+            "Token transfer refused. Recipient is blacklisted"
+        );
+        require(
+            !isBlacklisted(msg.sender),
+            "Token transfer refused. Sender is blacklisted"
+        );
+        super._beforeTokenTransfer(_from, _to, _amount);
+    }
 
-    // Calculate the amount of tokens to be liquidated to ETH by using Alpha Homora one-sided liquidity mechanism
-    IUniswapV2Pair uniswapPair =IUniswapV2Pair(tokenPairAddress);
-    (,,uint256 fee) = IUniswapV2Pair(uniswapPair).getReserves();
-     uint256 amountTokensToSwap = ((Math.sqrt(address(this).balance * 3 * liquidityFeeBalance * fee)) - (Math.sqrt(liquidityFeeBalance) * 2 * fee)) / (Math.sqrt(fee) * 2);
+    // Collects relevant fees and performs a swap if needed
+    function _transfer(
+        address _from,
+        address _to,
+        uint256 _amount
+    ) internal override {
+        require(_from != address(0), "Cannot transfer from the zero address");
+        require(_amount > 0, "Cannot transfer 0 tokens");
+        uint256 royaltyFees = 0;
+        uint256 liquidityFees = 0;
 
+        // Take fees on buys and sells
+        if (!_exemptFromFees[_from] && !_exemptFromFees[_to]) {
+            // Selling
+            if (automatedMarketMakerPairs[_to]) {
+                uint256 totalFee = royaltySellingFee + liquiditySellingFee;
 
-    // Swap
-    _swapTokenForEth(amountTokensToSwap);
+                if (royaltySellingFee > 0)
+                    royaltyFees = (_amount * royaltySellingFee) / maxPercentage;
+                if (liquiditySellingFee > 0)
+                    liquidityFees =
+                        (_amount * liquiditySellingFee) /
+                        maxPercentage;
+            }
+            // Buying
+            else if (automatedMarketMakerPairs[_from]) {
+                if (liquidityBuyingFee >= 0)
+                    liquidityFees =
+                        (_amount * liquidityBuyingFee) /
+                        maxPercentage;
+            }
 
-    // Add liquidity
-    _addLiquidity(amountTokensToSwap, address(this).balance - oldBalance);
+            uint256 totalFees = royaltyFees + liquidityFees;
 
-     // Update liquidityFeeBalance
-    liquidityFeeBalance  -= amountTokensToSwap;
-  }
+            // Send fees to the FEETOKEN contract
+            if (totalFees >= 0) {
+                // Send FEETOKEN tokens to the contract
+                super._transfer(_from, address(this), totalFees);
 
-  // Adds liquidity to the WETH / TOKEN pair on the AMM
-  function _addLiquidity(uint256 _tokenAmount, uint256 _ethAmount) internal {
-    _approve(address(this), address(exchangeRouter), _tokenAmount);
+                // Keep track of the FEETOKEN that were sent
+                royaltyFeeBalance += royaltyFees;
+                liquidityFeeBalance += liquidityFees;
+            }
 
-    // Add liquidity
-    exchangeRouter.addLiquidityETH{value: _ethAmount}(
-      address(this),
-      _tokenAmount,
-      0, // Slippage is unavoidable
-      0, // Slippage is unavoidable
-      address(0),
-      block.timestamp
-    );
+            _amount -= totalFees;
+        }
 
-  }
+        // Swapping logic - only trigger on sell
+        if (swapEnabled && automatedMarketMakerPairs[_to]) {
+            // If the one of the fee balances is above a certain amount, process it
+            // Do not process both in one transaction
+            if (!_swappingRoyalty && !_swappingLiquidity) {
+                if (royaltyFeeBalance >= minimumRoyaltyFeeBalanceToSwap) {
+                    // Forbid swapping royalty fees
+                    _swappingRoyalty = true;
 
-  // Swaps royalty fee balance for ETH and sends it to the royalty fee recipient
-  function _swapRoyaltyFeeBalance() internal {
-    require(royaltyFeeBalance > minimumRoyaltyFeeBalanceToSwap, 'Not enough tokens to swap for royalty fee');
+                    // Perform the swap
+                    _swapRoyaltyFeeBalance();
 
-    uint256 oldBalance = address(this).balance;
+                    // Allow swapping
+                    _swappingRoyalty = false;
+                } else if (
+                    liquidityFeeBalance >= minimumLiquidityFeeBalanceToSwap
+                ) {
+                    // Forbid swapping liquidity fees
+                    _swappingLiquidity = true;
 
-    // Swap
-    _swapTokenForEth(royaltyFeeBalance);
+                    // Perform the swap
+                    _liquify();
 
-    // Update royaltyFeeBalance
-    royaltyFeeBalance = 0;
+                    // Allow swapping
+                    _swappingLiquidity = false;
+                }
+            }
+        }
 
-    // Send ETH to royalty fee recipient
-    uint256 toSend = address(this).balance - oldBalance;
-    (bool success, ) = payable(royaltyFeeRecipient).call{value: toSend}("");
-    require(success, 'Royalty Fee Recipient Transfer Failed');
-  }
+        super._transfer(_from, _to, _amount);
+    }
 
-  // Swaps "_tokenAmount" for ETH
-  function _swapTokenForEth(uint256 _tokenAmount) internal {
-    // Define the path of the token and WETH in the Uniswap V2 router
-    address[] memory path = new address[](2);
-    path[0] = address(this);
-    path[1] = exchangeRouter.WETH();
+    // Swaps liquidity fee balance for ETH and adds it to the WETH / TOKEN pool
+    function _liquify() internal {
+        require(
+            liquidityFeeBalance >= minimumLiquidityFeeBalanceToSwap,
+            "Not enough tokens to swap for adding liquidity"
+        );
 
-    // Approve the Uniswap V2 router to spend the token
-    _approve(address(this), address(exchangeRouter), _tokenAmount);
+        uint256 oldBalance = address(this).balance;
 
-    // Get the minimum amount of ETH based on TWAP
-      IUniswapV2Pair uniswapPair = IUniswapV2Pair(tokenPairAddress);
-      (uint112 reserve0, uint112 reserve1, ) = uniswapPair.getReserves();
-      uint256 reserveIn = address(this) == uniswapPair.token0() ? reserve0 : reserve1;
-      uint256 reserveOut = address(this) == uniswapPair.token0() ? reserve1 : reserve0;
-      uint256 _minAmountEth = (_tokenAmount * reserveOut) / reserveIn;
+        // Calculate the amount of tokens to be liquidated to ETH by using Alpha Homora one-sided liquidity mechanism
+        IUniswapV2Pair uniswapPair = IUniswapV2Pair(tokenPairAddress);
+        (uint256 r0, uint256 r1, uint256 fee) = IUniswapV2Pair(uniswapPair)
+            .getReserves();
+        uint256 rIn = uniswapPair.token0() == exchangeRouter.WETH() ? r0 : r1;
+        uint256 aIn = Math
+            .sqrt(
+                rIn.mul(
+                    address(this).balance.mul(3988000).add(rIn.mul(3988009))
+                )
+            )
+            .sub(rIn.mul(1997)) / 1994;
 
-    exchangeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
-      _tokenAmount,
-      _minAmountEth, // accept any amount of ETH
-      path,
-      address(this),
-      block.timestamp
-    );
-  }
+        // Swap
+        _swapTokenForEth(amountTokensToSwap);
 
-  // Set or unset an address as an automated market pair / removes
-  function _setAutomatedMarketMakerPair(address _pair, bool _value) internal {
-    automatedMarketMakerPairs[_pair] = _value;
-  }
+        // Add liquidity
+        _addLiquidity(amountTokensToSwap, address(this).balance - oldBalance);
 
-  // Returns true if "_user" is blacklisted
-  function isBlacklisted(address _user) public view returns (bool) {
-    return _blacklist[_user];
-  }
+        // Update liquidityFeeBalance
+        liquidityFeeBalance -= amountTokensToSwap;
+    }
 
-  // Mint new tokens
-  function mint(address _to, uint256 _amount) public onlyRole(DEFAULT_ADMIN_ROLE) {
-    require(_to != address(0), 'Minter Address can not be null address');
-    require(_amount > 0, 'Mintable tokens count must be greater than 0');
+    // Adds liquidity to the WETH / TOKEN pair on the AMM
+    function _addLiquidity(uint256 _tokenAmount, uint256 _ethAmount) internal {
+        _approve(address(this), address(exchangeRouter), _tokenAmount);
 
-    _mint(_to, _amount);
-    emit NewTokensMinted(_to, _amount);
-  }
+        // Add liquidity
+        exchangeRouter.addLiquidityETH{value: _ethAmount}(
+            address(this),
+            _tokenAmount,
+            0, // Slippage is unavoidable
+            0, // Slippage is unavoidable
+            address(0),
+            block.timestamp
+        );
+    }
 
-  // Burns tokens
-  function burnTokens(address _from, uint256 _amount) public onlyRole(DEFAULT_ADMIN_ROLE) {
-    require(_from != address(0), 'Minter Address can not be null address');
-    require(_amount > 0, 'Mintable tokens count must be greater than 0');
-    require(allowance(_from, msg.sender) >= _amount, 'Burn amount exceeds allowance');
-    _burn(_from, _amount);
-    emit TokenBurned(_from, _amount);
-  }
+    // Swaps royalty fee balance for ETH and sends it to the royalty fee recipient
+    function _swapRoyaltyFeeBalance() internal {
+        require(
+            royaltyFeeBalance >= minimumRoyaltyFeeBalanceToSwap,
+            "Not enough tokens to swap for royalty fee"
+        );
 
-  function withdraw(uint256 _amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
-     //send deploy feee to ForkChain
-      (bool success, ) = payable(msg.sender).call{value: _amount}("");
-      require(success, "Transfer failed.");
-      emit Withdrawn(msg.sender, _amount);
-  }
+        uint256 oldBalance = address(this).balance;
 
-  // Withdraws an amount of tokens stored on the contract
-  function withdrawERC20(address _erc20, uint256 _amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
-    require(_erc20 != address(0), 'Minter Address can not be null address');
-    require(_amount > 0, 'Mintable tokens count must be greater than 0');
+        // Swap
+        _swapTokenForEth(royaltyFeeBalance);
 
-   IERC20(_erc20).safeTransfer(msg.sender, _amount);
+        // Update royaltyFeeBalance
+        royaltyFeeBalance = 0;
 
-    emit ERC20Withdrawn(_erc20, _amount);
-  }
+        // Send ETH to royalty fee recipient
+        uint256 toSend = address(this).balance - oldBalance;
+        (bool success, ) = payable(royaltyFeeRecipient).call{value: toSend}("");
+        require(success, "Royalty Fee Recipient Transfer Failed");
+    }
 
-  // Manually swaps the royalty fees
-  function manualRoyaltyFeeSwap() external onlyRole(DEFAULT_ADMIN_ROLE) {
-    // Forbid swapping royalty fees
-    _swappingRoyalty = true;
+    // Swaps "_tokenAmount" for ETH
+    function _swapTokenForEth(uint256 _tokenAmount) internal {
+        // Define the path of the token and WETH in the Uniswap V2 router
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = exchangeRouter.WETH();
 
-    // Perform the swap
-    _swapRoyaltyFeeBalance();
+        // Approve the Uniswap V2 router to spend the token
+        _approve(address(this), address(exchangeRouter), _tokenAmount);
 
-    // Allow swapping again
-    _swappingRoyalty = false;
+        (
+            uint112 reserve0,
+            uint112 reserve1,
+            uint32 blockTimestampLast
+        ) = IUniswapV2Pair(tokenPairAddress).getReserves();
 
-    emit ManualRoyaltySwapped(msg.sender);
-  }
+        // Calculate the time elapsed since the last block
+        uint32 timeElapsed = uint32(block.timestamp) - blockTimestampLast;
 
-  // Manually add liquidity
-  function manualLiquify() external onlyRole(DEFAULT_ADMIN_ROLE) {
-    // Forbid swapping liquidity fees
-    _swappingLiquidity = true;
+        // Get the average price of the token over the elapsed time period
+        uint256 price = uint256(reserve1).mul(1e18).div(reserve0).mul(1e18).div(
+            timeElapsed
+        );
 
-    // Perform swap
-    _liquify();
+        exchangeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            _tokenAmount,
+            _minAmountEth, // accept any amount of ETH
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
 
-    // Allow swapping again
-    _swappingLiquidity = false;
+    // Set or unset an address as an automated market pair / removes
+    function _setAutomatedMarketMakerPair(address _pair, bool _value) internal {
+        automatedMarketMakerPairs[_pair] = _value;
+    }
 
-    emit ManualLiquify(msg.sender);
-  }
+    // Returns true if "_user" is blacklisted
+    function isBlacklisted(address _user) public view returns (bool) {
+        return _blacklist[_user];
+    }
 
-  function blacklistAddress(address _user, bool _state) external onlyRole(DEFAULT_ADMIN_ROLE) {
-    require(_user != address(0), 'User address cannot be the zero address');
-    _blacklist[_user] = _state;
-    emit BlacklistAdded(_user, _state);
-  }
+    // Mint new tokens
+    function mint(
+        address _to,
+        uint256 _amount
+    ) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_to != address(0), "Minter Address can not be null address");
+        require(_amount > 0, "Mintable tokens count must be greater than 0");
 
-  function toggleSwapping() external onlyRole(DEFAULT_ADMIN_ROLE) {
-    swapEnabled = !swapEnabled;
-    emit SwapStatusToggled(swapEnabled);
-  }
+        _mint(_to, _amount);
+        emit NewTokensMinted(_to, _amount);
+    }
 
-  function excludeFromFees(address _account, bool _state) external onlyRole(DEFAULT_ADMIN_ROLE) {
-    require(_account != address(0), 'Account address can not be null address');
-    _exemptFromFees[_account] = _state;
-    emit FeesExluded(_account, _state);
-  }
+    // Burns tokens
+    function burnTokens(
+        address _from,
+        uint256 _amount
+    ) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_from != address(0), "Minter Address can not be null address");
+        require(_amount > 0, "Mintable tokens count must be greater than 0");
+        require(
+            allowance(_from, msg.sender) >= _amount,
+            "Burn amount exceeds allowance"
+        );
+        _spendAllowance(_from, msg.sender, _amount);
+        _burn(_from, _amount);
+        emit TokenBurned(_from, _amount);
+    }
 
-  function setRoyaltyFeeRecipient(address _royaltyFeeRecipient) external onlyRole(DEFAULT_ADMIN_ROLE) {
-    require(_royaltyFeeRecipient != address(0), 'Royalty recipient address can not be null address');
-    royaltyFeeRecipient = payable(_royaltyFeeRecipient);
-    emit RoayltyRecipientAddressChanged(_royaltyFeeRecipient);
-  }
+    function withdraw(uint256 _amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        //send deploy feee to ForkChain
+        (bool success, ) = payable(msg.sender).call{value: _amount}("");
+        require(success, "Transfer failed.");
+        emit Withdrawn(msg.sender, _amount);
+    }
 
-  function setAutomatedMarketMakerPair(address _pair, bool _value) external onlyRole(DEFAULT_ADMIN_ROLE) {
-    require(_pair != tokenPairAddress, 'The WETH / TOKEN pair cannot be removed from _automatedMarketMakerPairs');
-    _setAutomatedMarketMakerPair(_pair, _value);
-    emit AutomatedMarketMakerPair(_pair, _value);
-  }
+    // Withdraws an amount of tokens stored on the contract
+    function withdrawERC20(
+        address _erc20,
+        uint256 _amount
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_erc20 != address(0), "Minter Address can not be null address");
+        require(_amount > 0, "Mintable tokens count must be greater than 0");
 
-  function setMinimumRoyaltyFeeBalanceToSwap(uint256 _minimumRoyaltyFeeBalanceToSwap) external onlyRole(DEFAULT_ADMIN_ROLE) {
-    minimumRoyaltyFeeBalanceToSwap = _minimumRoyaltyFeeBalanceToSwap;
-    emit MinimumRoyaltyBalanceToSwap(_minimumRoyaltyFeeBalanceToSwap);
-  }
+        IERC20(_erc20).safeTransfer(msg.sender, _amount);
 
-  function setMinimumLiquidityFeeBalanceToSwap(uint256 _minimumLiquidityFeeBalanceToSwap) external onlyRole(DEFAULT_ADMIN_ROLE) {
-    minimumLiquidityFeeBalanceToSwap = _minimumLiquidityFeeBalanceToSwap;
-    emit MinimumLiquidityFeeBalanceToSwap(_minimumLiquidityFeeBalanceToSwap);
-  }
+        emit ERC20Withdrawn(_erc20, _amount);
+    }
 
-  function setRoyaltySellingFee(uint256 _royaltySellingFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
-    royaltySellingFee = _royaltySellingFee;
-    emit SetRoyaltySellingFee(_royaltySellingFee);
-  }
+    // Manually swaps the royalty fees
+    function manualRoyaltyFeeSwap() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        // Forbid swapping royalty fees
+        _swappingRoyalty = true;
 
-  function setLiquidityBuyingFee(uint256 _liquidityBuyingFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
-    liquidityBuyingFee = _liquidityBuyingFee;
-    emit SetLiquidityBuyingFee(_liquidityBuyingFee);
-  }
+        // Perform the swap
+        _swapRoyaltyFeeBalance();
 
-  function setLiquiditySellingFee(uint256 _liquiditySellingFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
-    liquiditySellingFee = _liquiditySellingFee;
-    emit SetLiquiditySellingFee(_liquiditySellingFee);
-  }
+        // Allow swapping again
+        _swappingRoyalty = false;
+
+        emit ManualRoyaltySwapped(msg.sender);
+    }
+
+    // Manually add liquidity
+    function manualLiquify() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        // Forbid swapping liquidity fees
+        _swappingLiquidity = true;
+
+        // Perform swap
+        _liquify();
+
+        // Allow swapping again
+        _swappingLiquidity = false;
+
+        emit ManualLiquify(msg.sender);
+    }
+
+    function blacklistAddress(
+        address _user,
+        bool _state
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_user != address(0), "User address cannot be the zero address");
+        _blacklist[_user] = _state;
+        emit BlacklistAdded(_user, _state);
+    }
+
+    function toggleSwapping() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        swapEnabled = !swapEnabled;
+        emit SwapStatusToggled(swapEnabled);
+    }
+
+    function excludeFromFees(
+        address _account,
+        bool _state
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(
+            _account != address(0),
+            "Account address can not be null address"
+        );
+        _exemptFromFees[_account] = _state;
+        emit FeesExluded(_account, _state);
+    }
+
+    function setRoyaltyFeeRecipient(
+        address _royaltyFeeRecipient
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(
+            _royaltyFeeRecipient != address(0),
+            "Royalty recipient address can not be null address"
+        );
+        royaltyFeeRecipient = payable(_royaltyFeeRecipient);
+        emit RoayltyRecipientAddressChanged(_royaltyFeeRecipient);
+    }
+
+    function setAutomatedMarketMakerPair(
+        address _pair,
+        bool _value
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(
+            _pair != tokenPairAddress,
+            "The WETH / TOKEN pair cannot be removed from _automatedMarketMakerPairs"
+        );
+        _setAutomatedMarketMakerPair(_pair, _value);
+        emit AutomatedMarketMakerPair(_pair, _value);
+    }
+
+    function setMinimumRoyaltyFeeBalanceToSwap(
+        uint256 _minimumRoyaltyFeeBalanceToSwap
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        minimumRoyaltyFeeBalanceToSwap = _minimumRoyaltyFeeBalanceToSwap;
+        emit MinimumRoyaltyBalanceToSwap(_minimumRoyaltyFeeBalanceToSwap);
+    }
+
+    function setMinimumLiquidityFeeBalanceToSwap(
+        uint256 _minimumLiquidityFeeBalanceToSwap
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        minimumLiquidityFeeBalanceToSwap = _minimumLiquidityFeeBalanceToSwap;
+        emit MinimumLiquidityFeeBalanceToSwap(
+            _minimumLiquidityFeeBalanceToSwap
+        );
+    }
+
+    function setRoyaltySellingFee(
+        uint256 _royaltySellingFee
+    )
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        totalFeeCalculation(_royaltySellingFee, liquiditySellingFee)
+    {
+        royaltySellingFee = _royaltySellingFee;
+        emit SetRoyaltySellingFee(_royaltySellingFee);
+    }
+
+    function setLiquidityBuyingFee(
+        uint256 _liquidityBuyingFee
+    )
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        totalFeeCalculation(0, _liquidityBuyingFee)
+    {
+        liquidityBuyingFee = _liquidityBuyingFee;
+        emit SetLiquidityBuyingFee(_liquidityBuyingFee);
+    }
+
+    function setLiquiditySellingFee(
+        uint256 _liquiditySellingFee
+    )
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        totalFeeCalculation(royaltySellingFee, _liquiditySellingFee)
+    {
+        liquiditySellingFee = _liquiditySellingFee;
+        emit SetLiquiditySellingFee(_liquiditySellingFee);
+    }
 }
