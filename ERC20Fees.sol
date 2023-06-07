@@ -9,11 +9,14 @@ import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
 import "@uniswap/v2-core/contracts/libraries/Math.sol";
 import "./interfaces/IUniswapV2Factory.sol";
 import "./interfaces/IUniswapV2Router02.sol";
+import "./UniswapOracle.sol";
 
 contract ERC20Fees is ERC20, Ownable, AccessControl {
     using SafeERC20 for IERC20;
 
     IUniswapV2Router02 public exchangeRouter;
+    UniswapOracle public priceOracle;
+
 
     address public tokenPairAddress;
 
@@ -36,7 +39,7 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
     uint256 public liquidityBuyingFee; // Fee going to liquidity when buying the token (/1000)
     uint256 public liquiditySellingFee; // Fee going to liquidity when selling the token (/1000)
 
-    uint256 public constant maxPercentage = 100_0;
+    uint256 public constant MAX_PERCENTAGE = 100_0;
 
     // Used to avoid stack too deep errors
     struct FeeSetup {
@@ -98,7 +101,10 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
             _exchangeRouter != address(0),
             "Exchange Router address can not be null address"
         );
-
+          require(
+            _feeSetup.royaltySellingFee + _feeSetup.liquiditySellingFee <= 10_0,
+            "Total fees exceed 100%"
+        );
         // Set up roles
         _setupRole(DEFAULT_ADMIN_ROLE, address(_defaultAdmin));
 
@@ -108,10 +114,13 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
         }
 
         // Link to AMM
+
         exchangeRouter = IUniswapV2Router02(_exchangeRouter);
         tokenPairAddress = IUniswapV2Factory(exchangeRouter.factory())
             .createPair(address(this), exchangeRouter.WETH());
         _setAutomatedMarketMakerPair(address(tokenPairAddress), true);
+        
+        priceOracle = new UniswapOracle(exchangeRouter.factory(), address(this), exchangeRouter.WETH());
 
         // Exempt some addresses from fees
         _exemptFromFees[msg.sender] = true;
@@ -184,18 +193,18 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
                 uint256 totalFee = royaltySellingFee + liquiditySellingFee;
 
                 if (royaltySellingFee > 0)
-                    royaltyFees = (_amount * royaltySellingFee) / maxPercentage;
+                    royaltyFees = (_amount * royaltySellingFee) / MAX_PERCENTAGE;
                 if (liquiditySellingFee > 0)
                     liquidityFees =
                         (_amount * liquiditySellingFee) /
-                        maxPercentage;
+                        MAX_PERCENTAGE;
             }
             // Buying
             else if (automatedMarketMakerPairs[_from]) {
                 if (liquidityBuyingFee >= 0)
                     liquidityFees =
                         (_amount * liquidityBuyingFee) /
-                        maxPercentage;
+                        MAX_PERCENTAGE;
             }
 
             uint256 totalFees = royaltyFees + liquidityFees;
@@ -323,28 +332,18 @@ contract ERC20Fees is ERC20, Ownable, AccessControl {
         // Approve the Uniswap V2 router to spend the token
         _approve(address(this), address(exchangeRouter), _tokenAmount);
 
-        (
-            uint112 reserve0,
-            uint112 reserve1,
-            uint32 blockTimestampLast
-        ) = IUniswapV2Pair(tokenPairAddress).getReserves();
-
-        // Calculate the time elapsed since the last block
-        uint32 timeElapsed = uint32(block.timestamp) - blockTimestampLast;
-
-        // Get the average price of the token over the elapsed time period
-        uint256 price = uint256(reserve1).mul(1e18).div(reserve0).mul(1e18).div(
-            timeElapsed
-        );
+        // Get the average price of the token over the elapsed time period using the TWAP Oracle
+        uint256 price = priceOracle.consult(address(this), _tokenAmount);
 
         exchangeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
             _tokenAmount,
-            _minAmountEth, // accept any amount of ETH
+            price, // accept any amount of ETH
             path,
             address(this),
             block.timestamp
         );
     }
+
 
     // Set or unset an address as an automated market pair / removes
     function _setAutomatedMarketMakerPair(address _pair, bool _value) internal {
